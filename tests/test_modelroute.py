@@ -233,3 +233,189 @@ def test_anthropic_stream_is_converted_from_openai_sse() -> None:
     assert "event: content_block_delta" in response.text
     assert '"text": "hi"' in response.text
     assert "event: message_stop" in response.text
+
+
+def test_anthropic_stream_converts_openai_tool_calls() -> None:
+    sse = (
+        b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        b'"function":{"name":"get_weather","arguments":"{\\"city\\""}}]},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"arguments":":\\"Paris\\"}"}}]},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "route.test":
+            return json_response({"model": "provider/selected"})
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse)
+
+    response = run(request_app(
+        httpx.MockTransport(handler),
+        "/v1/messages",
+        {"model": "claude", "stream": True, "messages": [{"role": "user", "content": "weather?"}]},
+    ))
+
+    assert response.status_code == 200
+    text = response.text
+
+    # A tool_use content block must be opened with the tool id and name.
+    tool_starts = [
+        json.loads(line[len("data:"):].strip())
+        for line in text.splitlines()
+        if line.startswith("data:") and '"content_block_start"' in line
+    ]
+    tool_block = next(e for e in tool_starts if e["content_block"]["type"] == "tool_use")
+    assert tool_block["content_block"]["name"] == "get_weather"
+    assert tool_block["content_block"]["id"] == "call_1"
+
+    # input_json_delta fragments must reassemble to the full tool arguments.
+    partials = [
+        json.loads(line[len("data:"):].strip())["delta"]["partial_json"]
+        for line in text.splitlines()
+        if line.startswith("data:") and '"input_json_delta"' in line
+    ]
+    assert json.loads("".join(partials)) == {"city": "Paris"}
+
+    # finish_reason tool_calls maps to stop_reason tool_use.
+    assert '"stop_reason": "tool_use"' in text
+
+
+def test_anthropic_tool_result_becomes_openai_tool_message() -> None:
+    calls: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.host == "route.test":
+            calls["decision_body"] = body
+            return json_response({"model": "provider/selected"})
+        calls["upstream_body"] = body
+        return json_response(openai_completion_response(body["model"], "done"))
+
+    response = run(request_app(
+        httpx.MockTransport(handler),
+        "/v1/messages",
+        {
+            "model": "claude",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "18C sunny"}]},
+                ]},
+            ],
+        },
+    ))
+
+    assert response.status_code == 200
+    messages = calls["upstream_body"]["messages"]
+
+    assistant = next(m for m in messages if m["role"] == "assistant")
+    assert assistant["tool_calls"][0]["id"] == "toolu_1"
+    assert assistant["tool_calls"][0]["function"]["name"] == "get_weather"
+    # Assistant content is not polluted with synthetic [tool_use:...] text.
+    assert assistant["content"] in (None, "")
+
+    tool_message = next(m for m in messages if m["role"] == "tool")
+    assert tool_message["tool_call_id"] == "toolu_1"
+    assert tool_message["content"] == "18C sunny"
+    # The tool message immediately follows the assistant tool_calls turn.
+    assert messages.index(tool_message) == messages.index(assistant) + 1
+    # No Python repr or synthetic tool markers leaked anywhere.
+    assert "[tool_use:" not in json.dumps(messages)
+    assert "'type':" not in json.dumps(messages)
+
+
+def test_cache_control_is_preserved_on_all_surfaces() -> None:
+    calls: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.host == "route.test":
+            return json_response({"model": "provider/selected"})
+        calls["upstream_body"] = body
+        return json_response(openai_completion_response(body["model"], "done"))
+
+    response = run(request_app(
+        httpx.MockTransport(handler),
+        "/v1/messages",
+        {
+            "model": "claude",
+            "max_tokens": 64,
+            "system": [
+                {"type": "text", "text": "stable preamble"},
+                {"type": "text", "text": "<big doc>", "cache_control": {"type": "ephemeral"}},
+            ],
+            "tools": [
+                {"name": "get_weather", "description": "w", "input_schema": {"type": "object"},
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "long context", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "ack", "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "res",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ],
+        },
+    ))
+
+    assert response.status_code == 200
+    body = calls["upstream_body"]
+
+    # System: cache_control rides on the structured text part.
+    system = next(m for m in body["messages"] if m["role"] == "system")
+    assert system["content"][1]["cache_control"] == {"type": "ephemeral"}
+
+    # User text part: TTL is preserved verbatim.
+    user = next(m for m in body["messages"] if m["role"] == "user")
+    assert user["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    # Assistant text part.
+    assistant = next(m for m in body["messages"] if m["role"] == "assistant")
+    assert assistant["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    # Tool result content part.
+    tool_message = next(m for m in body["messages"] if m["role"] == "tool")
+    assert tool_message["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    # Tool definition.
+    assert body["tools"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_no_cache_control_keeps_plain_string_content() -> None:
+    calls: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.host == "route.test":
+            return json_response({"model": "provider/selected"})
+        calls["upstream_body"] = body
+        return json_response(openai_completion_response(body["model"], "done"))
+
+    response = run(request_app(
+        httpx.MockTransport(handler),
+        "/v1/messages",
+        {
+            "model": "claude",
+            "max_tokens": 64,
+            "system": "be concise",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        },
+    ))
+
+    assert response.status_code == 200
+    # Without cache_control, content collapses to compact plain strings (no bloat).
+    for message in calls["upstream_body"]["messages"]:
+        assert isinstance(message["content"], str)
+
+

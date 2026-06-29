@@ -121,6 +121,50 @@ def text_from_content(content: Any) -> str:
     return str(content)
 
 
+def text_blocks_only(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def cache_control_of(block: Any) -> dict[str, Any] | None:
+    if isinstance(block, dict):
+        cc = block.get("cache_control")
+        if isinstance(cc, dict):
+            return cc
+    return None
+
+
+def anthropic_system_to_openai(system: Any) -> Any:
+    if not isinstance(system, list):
+        return text_from_content(system)
+
+    out: list[dict[str, Any]] = []
+    has_cache_control = False
+    for block in system:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        part: dict[str, Any] = {"type": "text", "text": str(block.get("text") or "")}
+        cc = cache_control_of(block)
+        if cc:
+            part["cache_control"] = cc
+            has_cache_control = True
+        out.append(part)
+
+    if not out:
+        return ""
+    if not has_cache_control:
+        return "\n".join(str(item.get("text") or "") for item in out)
+    return out
+
+
 def anthropic_user_content_to_openai(content: Any) -> Any:
     if isinstance(content, str):
         return content
@@ -128,32 +172,61 @@ def anthropic_user_content_to_openai(content: Any) -> Any:
         return text_from_content(content)
 
     out: list[dict[str, Any]] = []
+    has_cache_control = False
     for block in content:
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")
+        cc = cache_control_of(block)
         if block_type == "text":
-            out.append({"type": "text", "text": str(block.get("text") or "")})
+            part: dict[str, Any] = {"type": "text", "text": str(block.get("text") or "")}
         elif block_type == "image":
             source = block.get("source")
-            if isinstance(source, dict) and source.get("type") == "base64":
-                media_type = source.get("media_type") or "image/png"
-                data = source.get("data") or ""
-                out.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}})
-        elif block_type == "tool_result":
-            out.append({"type": "text", "text": str(block.get("content") or "")})
+            if not (isinstance(source, dict) and source.get("type") == "base64"):
+                continue
+            media_type = source.get("media_type") or "image/png"
+            data = source.get("data") or ""
+            part = {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{data}"}}
+        else:
+            continue
+        if cc:
+            part["cache_control"] = cc
+            has_cache_control = True
+        out.append(part)
 
     if not out:
         return ""
-    if all(item.get("type") == "text" for item in out):
+    # Collapse to a plain string only when there is no cache_control to preserve —
+    # cache_control can only ride on a structured content part, not a bare string.
+    if not has_cache_control and all(item.get("type") == "text" for item in out):
         return "\n".join(str(item.get("text") or "") for item in out)
     return out
 
 
 def anthropic_assistant_to_openai(message: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {"role": "assistant", "content": text_from_content(message.get("content"))}
-    tool_calls: list[dict[str, Any]] = []
     content = message.get("content")
+
+    text_parts: list[dict[str, Any]] = []
+    has_cache_control = False
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            part: dict[str, Any] = {"type": "text", "text": str(block.get("text") or "")}
+            cc = cache_control_of(block)
+            if cc:
+                part["cache_control"] = cc
+                has_cache_control = True
+            text_parts.append(part)
+
+    out: dict[str, Any] = {"role": "assistant"}
+    if has_cache_control:
+        # Keep the structured array so cache_control survives.
+        out["content"] = text_parts
+    else:
+        out["content"] = text_blocks_only(content)
+
+    tool_calls: list[dict[str, Any]] = []
     if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -168,7 +241,46 @@ def anthropic_assistant_to_openai(message: dict[str, Any]) -> dict[str, Any]:
             })
     if tool_calls:
         out["tool_calls"] = tool_calls
+        # OpenAI expects content to be null (not synthetic text) when only tool calls are present.
+        if not has_cache_control and not out["content"]:
+            out["content"] = None
     return out
+
+
+def anthropic_user_message_to_openai(content: Any) -> list[dict[str, Any]]:
+    """Convert an Anthropic user turn into one or more OpenAI messages.
+
+    tool_result blocks become standalone `role:"tool"` messages (carrying the
+    matching tool_call_id) so the tool_use_id link survives; remaining content
+    becomes a single user message placed after the tool messages, as OpenAI
+    requires tool results to immediately follow the assistant tool_calls turn.
+    """
+    if not isinstance(content, list):
+        return [{"role": "user", "content": anthropic_user_content_to_openai(content)}]
+
+    tool_messages: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            tool_message: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": str(block.get("tool_use_id") or ""),
+                "content": text_from_content(block.get("content")),
+            }
+            cc = cache_control_of(block)
+            if cc:
+                # Carry cache_control on a structured content part so the breakpoint survives.
+                tool_message["content"] = [
+                    {"type": "text", "text": text_from_content(block.get("content")), "cache_control": cc}
+                ]
+            tool_messages.append(tool_message)
+        else:
+            remaining.append(block)
+
+    messages = list(tool_messages)
+    if remaining or not tool_messages:
+        messages.append({"role": "user", "content": anthropic_user_content_to_openai(remaining)})
+    return messages
 
 
 def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
@@ -187,21 +299,24 @@ def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
 
     system = body.get("system")
     if system:
-        out["messages"].append({"role": "system", "content": text_from_content(system)})
+        out["messages"].append({"role": "system", "content": anthropic_system_to_openai(system)})
 
     for message in body.get("messages") or []:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
         if role == "user":
-            out["messages"].append({"role": "user", "content": anthropic_user_content_to_openai(message.get("content"))})
+            out["messages"].extend(anthropic_user_message_to_openai(message.get("content")))
         elif role == "assistant":
             out["messages"].append(anthropic_assistant_to_openai(message))
 
     tools = body.get("tools")
     if isinstance(tools, list):
-        out["tools"] = [
-            {
+        converted_tools: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            converted: dict[str, Any] = {
                 "type": "function",
                 "function": {
                     "name": str(tool.get("name") or ""),
@@ -209,9 +324,11 @@ def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
                     "parameters": tool.get("input_schema") or {},
                 },
             }
-            for tool in tools
-            if isinstance(tool, dict)
-        ]
+            cc = cache_control_of(tool)
+            if cc:
+                converted["cache_control"] = cc
+            converted_tools.append(converted)
+        out["tools"] = converted_tools
 
     tool_choice = body.get("tool_choice")
     if isinstance(tool_choice, dict):
@@ -303,14 +420,15 @@ async def openai_stream_to_anthropic(response: httpx.Response, selected_model: s
             "usage": {"input_tokens": 0, "output_tokens": 0},
         },
     })
-    yield sse_event("content_block_start", {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    })
 
     buffer = ""
     finish_reason = "stop"
+    output_tokens = 0
+    next_index = 0
+    open_index: int | None = None  # the currently-open Anthropic content block, if any
+    open_kind: str | None = None   # "text" or "tool"
+    tool_index_map: dict[int, int] = {}  # OpenAI tool_calls[].index -> Anthropic block index
+
     async for chunk in response.aiter_text():
         buffer += chunk
         while "\n" in buffer:
@@ -327,24 +445,77 @@ async def openai_stream_to_anthropic(response: httpx.Response, selected_model: s
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+
+            usage = data.get("usage")
+            if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                output_tokens = int(usage.get("completion_tokens") or 0)
+
             choices = data.get("choices") if isinstance(data.get("choices"), list) else []
             choice = choices[0] if choices and isinstance(choices[0], dict) else {}
             if choice.get("finish_reason"):
                 finish_reason = str(choice.get("finish_reason"))
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+
             text = delta.get("content")
             if text:
+                if open_kind == "tool":
+                    yield sse_event("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                    open_index, open_kind = None, None
+                if open_kind != "text":
+                    open_index, open_kind = next_index, "text"
+                    next_index += 1
+                    yield sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": open_index,
+                        "content_block": {"type": "text", "text": ""},
+                    })
                 yield sse_event("content_block_delta", {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": open_index,
                     "delta": {"type": "text_delta", "text": str(text)},
                 })
 
-    yield sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    tc_index = tool_call.get("index")
+                    if tc_index is None:
+                        tc_index = 0
+                    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                    if tc_index not in tool_index_map:
+                        if open_index is not None:
+                            yield sse_event("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                        block_index = next_index
+                        next_index += 1
+                        tool_index_map[tc_index] = block_index
+                        open_index, open_kind = block_index, "tool"
+                        yield sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": str(tool_call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"),
+                                "name": str(function.get("name") or ""),
+                                "input": {},
+                            },
+                        })
+                    block_index = tool_index_map[tc_index]
+                    arguments = function.get("arguments")
+                    if arguments:
+                        yield sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "input_json_delta", "partial_json": str(arguments)},
+                        })
+
+    if open_index is not None:
+        yield sse_event("content_block_stop", {"type": "content_block_stop", "index": open_index})
     yield sse_event("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": FINISH_TO_STOP_REASON.get(finish_reason, "end_turn"), "stop_sequence": None},
-        "usage": {"output_tokens": 0},
+        "usage": {"output_tokens": output_tokens},
     })
     yield sse_event("message_stop", {"type": "message_stop"})
 
