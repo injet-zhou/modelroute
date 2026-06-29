@@ -56,11 +56,17 @@ def endpoint_url(base_url: str, endpoint: str) -> str:
 
 
 def forwarded_request_headers(request: Request) -> dict[str, str]:
-    return {
+    headers = {
         name: value
         for name, value in request.headers.items()
         if name.lower() not in HOP_BY_HOP_HEADERS
     }
+    has_authorization = any(name.lower() == "authorization" for name in headers)
+    if not has_authorization:
+        x_api_key = next((value for name, value in headers.items() if name.lower() == "x-api-key"), None)
+        if x_api_key:
+            headers["authorization"] = f"Bearer {x_api_key}"
+    return headers
 
 
 def forwarded_response_headers(response: httpx.Response) -> dict[str, str]:

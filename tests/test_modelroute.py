@@ -126,6 +126,37 @@ def test_anthropic_messages_converts_for_decision_and_returns_anthropic_response
     assert data["usage"] == {"input_tokens": 3, "output_tokens": 2}
 
 
+def test_anthropic_x_api_key_is_forwarded_as_bearer_auth() -> None:
+    calls: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "route.test":
+            calls["decision_auth"] = request.headers.get("authorization")
+            calls["decision_x_api_key"] = request.headers.get("x-api-key")
+            return json_response({"model": "anthropic-compatible/selected"})
+        calls["upstream_auth"] = request.headers.get("authorization")
+        calls["upstream_x_api_key"] = request.headers.get("x-api-key")
+        body = json.loads(request.content)
+        return json_response(openai_completion_response(body["model"], "anthropic ok"))
+
+    response = run(request_app(
+        httpx.MockTransport(handler),
+        "/v1/messages",
+        {
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 128,
+        },
+        headers={"x-api-key": "anthropic-style-key", "anthropic-version": "2023-06-01"},
+    ))
+
+    assert response.status_code == 200
+    assert calls["decision_auth"] == "Bearer anthropic-style-key"
+    assert calls["upstream_auth"] == "Bearer anthropic-style-key"
+    assert calls["decision_x_api_key"] == "anthropic-style-key"
+    assert calls["upstream_x_api_key"] == "anthropic-style-key"
+
+
 def test_route_decision_failure_is_returned_without_upstream_call() -> None:
     calls = {"upstream": 0}
 
